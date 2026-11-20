@@ -1,0 +1,47 @@
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: demo
+  namespace: default
+spec:
+  mode: deployment
+  image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector:0.163.2
+  config:
+    # Accept telemetry from instrumented applications using OTLP.
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            # Python auto-instrumentation sends HTTP/protobuf to this port.
+            endpoint: 0.0.0.0:4318
+    processors:
+      # Refuse incoming data under memory pressure to help prevent out-of-memory crashes.
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 75
+        spike_limit_percentage: 15
+    exporters:
+      debug:
+        # Print signal counts to collector logs; use detailed for payloads and span IDs.
+        verbosity: basic
+    service:
+      # Enable each signal and connect its receiver -> processors -> exporters.
+      # Declaring a component above does not enable it until a pipeline references it.
+      pipelines:
+        # Traces describe requests and the operations (spans) performed within them.
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter]
+          exporters: [debug]
+        # Metrics are numerical measurements, such as request counts and durations.
+        metrics:
+          receivers: [otlp]
+          processors: [memory_limiter]
+          exporters: [debug]
+        # Receive exported application log records, not arbitrary container stdout.
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter]
+          exporters: [debug]
