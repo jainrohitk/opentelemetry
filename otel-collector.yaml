@@ -6,6 +6,10 @@ metadata:
 spec:
   mode: deployment
   image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector:0.163.2
+  ports:
+    - name: prometheus
+      port: 8889
+      targetPort: 8889
   config:
     # Accept telemetry from instrumented applications using OTLP.
     receivers:
@@ -23,6 +27,16 @@ spec:
         limit_percentage: 75
         spike_limit_percentage: 15
     exporters:
+      # Prometheus scrapes application metrics from this endpoint.
+      prometheus:
+        endpoint: 0.0.0.0:8889
+        resource_to_telemetry_conversion:
+          enabled: true
+      # Store traces in Tempo so Grafana can query them.
+      otlp/tempo:
+        endpoint: tempo.default.svc.cluster.local:4317
+        tls:
+          insecure: true
       debug:
         # Print signal counts to collector logs; use detailed for payloads and span IDs.
         verbosity: basic
@@ -34,12 +48,12 @@ spec:
         traces:
           receivers: [otlp]
           processors: [memory_limiter]
-          exporters: [debug]
+          exporters: [debug, otlp/tempo]
         # Metrics are numerical measurements, such as request counts and durations.
         metrics:
           receivers: [otlp]
           processors: [memory_limiter]
-          exporters: [debug]
+          exporters: [debug, prometheus]
         # Receive exported application log records, not arbitrary container stdout.
         logs:
           receivers: [otlp]
