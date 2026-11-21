@@ -21,6 +21,10 @@ flowchart TB
             Client["Python caller Pod<br/>Auto-instrumented<br/>Port 5000"]
         end
 
+        subgraph KedaNamespace["Namespace: keda"]
+            KEDA["KEDA<br/>Prometheus scaler"]
+        end
+
         subgraph DefaultNamespace["Namespace: default"]
             Collector["OpenTelemetry Collector<br/>demo-collector"]
             Tempo[("Tempo<br/>Trace storage")]
@@ -48,11 +52,13 @@ flowchart TB
     Collector -->|"Traces: OTLP gRPC :4317"| Tempo
     Collector -->|"Logs: OTLP HTTP :3100/otlp/v1/logs"| Loki
     Tempo -->|"Service-graph metrics: remote write :9090"| Prometheus
-    Prometheus -->|"Scrape app metrics: HTTP :8889 every 15s"| Collector
+    Prometheus -->|"Scrape app metrics: HTTP :8889 every 5s"| Collector
     Grafana -->|"Query traces: HTTP :3200"| Tempo
     Grafana -->|"Query metrics: HTTP :9090"| Prometheus
     Grafana -->|"Query logs: HTTP :3100"| Loki
     Collector -->|"Debug exporter: all three signals"| DebugLogs
+    KEDA -->|"Query server request rate: HTTP :9090"| Prometheus
+    KEDA -.->|"Manage HPA: 1-8 server replicas"| App
 
     classDef app fill:#DBEAFE,stroke:#2563EB,color:#0F172A
     classDef collector fill:#FEF3C7,stroke:#D97706,color:#0F172A
@@ -61,13 +67,15 @@ flowchart TB
     class App,Client app
     class Collector,Grafana collector
     class Tempo,Prometheus,Loki storage
-    class CertManager,Operator,Instrumentation platform
+    class CertManager,Operator,Instrumentation,KEDA platform
 ```
 
 Solid arrows show telemetry or query/request traffic; dotted arrows show
 configuration and management. Prometheus pulls metrics from the Collector;
 Tempo remote-writes trace-derived metrics to Prometheus. Grafana queries Tempo,
 Prometheus, and Loki. Logs are stored in Loki and also counted in Collector output.
+KEDA queries application request metrics in Prometheus and manages an HPA;
+Kubernetes scales the server Deployment.
 
 | Resource | Namespace |
 | --- | --- |
@@ -75,6 +83,7 @@ Prometheus, and Loki. Logs are stored in Loki and also counted in Collector outp
 | OpenTelemetry Operator | `opentelemetry-operator-system` |
 | Collector `demo` | `default` |
 | Tempo, Prometheus, Loki, and Grafana | `default` |
+| KEDA operator, metrics API server, and admission webhooks | `keda` |
 | Python backend Service, both Deployments, and Instrumentation | `python` |
 
 Use **PowerShell** unless a block is marked **Bash**, from this repository's root.
@@ -94,9 +103,11 @@ bash setup.sh
 order, and waits for readiness. It targets `kind-mykind`, reuses the matching
 operator, and stops on errors. Rerunning updates the manifests and restarts the
 Python services to pick up instrumentation changes. Tempo restarts to reload
-metrics-generator settings, Loki restarts to reload its configuration, and
+metrics-generator settings, Prometheus and Loki restart to reload their configuration, and
 Grafana restarts to reload its provisioned data sources. These restarts clear
-their temporary demo data. A different existing operator version requires manual review.
+their temporary demo data. Setup also installs KEDA and the server's ScaledObject,
+or reuses the matching KEDA operator. A different existing OpenTelemetry or KEDA
+operator version requires manual review.
 
 The script starts and checks four `nohup` port-forwards: Python on `5000`,
 the caller on `5001`, Grafana on `3000`, and Prometheus on `9090`. Logs and PIDs are saved in
@@ -163,6 +174,7 @@ kubectl apply -f .\tempo.yaml
 kubectl rollout restart deployment/tempo -n default
 kubectl rollout status deployment/tempo -n default --timeout=300s
 kubectl apply -f .\prometheus.yaml
+kubectl rollout restart deployment/prometheus -n default
 kubectl rollout status deployment/prometheus -n default --timeout=300s
 kubectl apply -f .\loki.yaml
 kubectl rollout restart deployment/loki -n default
@@ -192,6 +204,7 @@ kubectl rollout status deployment/python-client -n python --timeout=300s
 | [py-instrumentation.yaml](./py-instrumentation.yaml) | Configure Python instrumentation and the collector endpoint |
 | [py-server.yaml](./py-server.yaml) | Create namespace `python` and run an inline Flask app using official `python:3.12-slim` |
 | [py-client.yaml](./py-client.yaml) | Run an instrumented Flask caller that uses Requests to call the backend Service |
+| [keda-scaler.yaml](./keda-scaler.yaml) | Scale `python-server` from 1 to 8 replicas using application request rate |
 
 When migrating from the old `python-otel` name, deploy `python-server` and wait
 for readiness before applying the updated caller. Verify a caller request, then
@@ -324,9 +337,9 @@ Look for positive counts:
 | Metrics | `Metrics` and `data points` |
 | Logs | `Logs` and `log records` |
 
-Allow a few seconds for traces/logs and at least a minute for metrics. Health
-probes also generate requests. The sample app emits a Python warning log per
-request to make log export easy to test.
+Allow a few seconds for traces/logs, 15-30 seconds for server metrics, and 60-90
+seconds for caller metrics. Health probes also generate requests. The sample app
+emits a Python warning log per request to make log export easy to test.
 
 For individual span IDs, attributes, and log bodies, change
 `debug.verbosity` from `basic` to `detailed` in
@@ -374,8 +387,9 @@ In the same Grafana instance, choose **Explore > Prometheus** and run:
 {service_name="python-server"}
 ```
 
-Generate app requests and allow 60-90 seconds for Python's periodic metrics
-export and Prometheus scraping. Switch to a graph to see values over time.
+Generate app requests and allow 15-30 seconds for the server's periodic metrics
+export and Prometheus scraping. The caller retains the SDK's default 60-second
+export interval, so its metrics can take 60-90 seconds. Switch to a graph to see values over time.
 To find HTTP request measurements, use:
 
 ```promql
@@ -441,6 +455,73 @@ Prometheus clears that component's temporary demo data. Their active
 port-forwards may exit when Pods are replaced; inspect and stop any remaining
 recorded forwards before starting new ones.
 
+## 6. Autoscale the Python server with KEDA
+
+Setup installs KEDA `2.21.0` and applies [keda-scaler.yaml](./keda-scaler.yaml).
+The official version-pinned installation bundle supplies KEDA's operator,
+metrics API server, admission webhooks, CRDs, and permissions.
+[keda-scaler.yaml](./keda-scaler.yaml) contains only this demo's ScaledObject;
+install KEDA before applying it.
+For a manual installation:
+
+```powershell
+kubectl --context kind-mykind apply --server-side -f https://github.com/kedacore/keda/releases/download/v2.21.0/keda-2.21.0.yaml
+kubectl --context kind-mykind wait --for=condition=Established crd/scaledobjects.keda.sh --timeout=120s
+kubectl --context kind-mykind rollout status deployment/keda-operator -n keda --timeout=300s
+kubectl --context kind-mykind rollout status deployment/keda-metrics-apiserver -n keda --timeout=300s
+kubectl --context kind-mykind rollout status deployment/keda-admission -n keda --timeout=300s
+kubectl --context kind-mykind wait --for=condition=Available apiservice/v1beta1.external.metrics.k8s.io --timeout=180s
+kubectl --context kind-mykind apply -f .\keda-scaler.yaml
+kubectl --context kind-mykind wait --for=condition=Ready scaledobject/python-server -n python --timeout=120s
+```
+
+KEDA creates and manages an HPA targeting `python-server`. It queries the
+application's OpenTelemetry HTTP duration histogram count in Prometheus, not
+CPU/memory or trace-derived metrics:
+
+```promql
+sum(rate(http_server_duration_milliseconds_count{service_name="python-server",k8s_namespace_name="python",http_target!="/"}[30s]))
+```
+
+The query sums incoming requests across server replicas, excluding `/` because
+the demo's health probes use that path. Root requests are therefore not counted.
+The target is **5 requests/second per replica**, with **1-8 replicas**.
+The server exports metrics every **10 seconds** (`OTEL_METRIC_EXPORT_INTERVAL=10000`),
+Prometheus scrapes the Collector every **5 seconds**, and the query averages
+over **30 seconds**. This adds capacity earlier; it is not a measured service
+capacity limit or a guarantee of response latency.
+The server manifest omits `replicas` so reapplying it does not overwrite the
+autoscaler's replica count. Do not add a second HPA for the same Deployment.
+Missing metrics are reported as scaler errors rather than treated as zero.
+Generate traffic through the caller first if the non-root metric does not exist.
+
+Run in one PowerShell terminal:
+
+```powershell
+kubectl --context kind-mykind get hpa -n python --watch
+```
+
+Run in another, keeping the caller port-forward active:
+
+```powershell
+.\generate-traffic.ps1 -Count 1500 -MinRequestsPerSecond 15 -MaxRequestsPerSecond 20 -Concurrency 5
+```
+
+Calls through the caller use the server's Kubernetes Service and can reach all
+ready server replicas. A direct server port-forward targets only one Pod.
+Start with this moderate load; higher rates can overload the single caller or
+the local kind node even while the server scales.
+Allow roughly 30-60 seconds for metrics and HPA decisions, plus Pod startup time.
+Each new demo Pod installs Flask before becoming ready, which can take longer
+and depends on internet access. Scale-down uses HPA's default five-minute
+stabilization window to avoid removing capacity too quickly.
+Keeping one replica avoids HTTP scale-to-zero
+routing requirements.
+
+KEDA `2.21` documents testing with Kubernetes `1.34-1.36`; newer clusters are
+outside that stated test matrix. Verify the external metrics API and scaling
+behavior before relying on this demo in another environment.
+
 ## Troubleshooting
 
 Start with application logs and Pod details:
@@ -476,7 +557,19 @@ kubectl exec -n python deployment/python-server -c python-server -- printenv OTE
   target for trace ingestion and metrics generation; larger loads may need more.
   `OOMKilled` means the container exceeded its memory limit. Config parse errors
   require correcting the embedded YAML in [tempo.yaml](./tempo.yaml).
-- **No metrics in Grafana:** allow 60-90 seconds after making requests. Check
+- **Python container restarts:** inspect the affected Pod's previous container
+  logs with `kubectl logs -n python <pod-name> -c python-server --previous`
+  (use `python-client` for the caller) and its events with
+  `kubectl describe pod -n python <pod-name>`. Dependency downloads still happen
+  at every container startup. A `pip` download timeout from
+  `files.pythonhosted.org` was observed with exit code `2`; this startup
+  dependency remains unresolved. Under load, the current one-second HTTP probe
+  timeout can also cause liveness failures and restarts. Packaging dependencies
+  into an image would remove startup downloads, but is not implemented here.
+  KEDA scale-down deletes Pods; it does not increment a surviving container's
+  restart count. Readiness failures alone do not restart containers.
+- **No metrics in Grafana:** allow 15-30 seconds for server metrics and 60-90
+  seconds for caller metrics after making requests. Check
   Prometheus readiness and its scrape target, and confirm the Collector Service
   exposes port `8889`. Rerun setup to reload the Grafana data sources.
 - **No logs in Grafana:** generate fresh requests, check Loki readiness and
@@ -484,6 +577,10 @@ kubectl exec -n python deployment/python-server -c python-server -- printenv OTE
   Loki's OTLP ingestion requires schema `v13` and structured metadata enabled.
   Apply the Loki, Collector, and Grafana manifests and restart Grafana if the
   Loki data source is missing.
+- **No autoscaling:** inspect `kubectl describe scaledobject python-server -n python`
+  and `kubectl describe hpa keda-hpa-python-server -n python`. Check KEDA readiness,
+  the external metrics API, and the Prometheus query above. Root-only traffic,
+  missing application metrics, or insufficient request rate will not scale up.
 
 ## Notes
 
@@ -507,3 +604,5 @@ kubectl exec -n python deployment/python-server -c python-server -- printenv OTE
 - [Tempo service graphs](https://grafana.com/docs/grafana/latest/datasources/tempo/service-graph/)
 - [Prometheus data source](https://grafana.com/docs/grafana/latest/datasources/prometheus/)
 - [Loki OpenTelemetry ingestion](https://grafana.com/docs/loki/latest/send-data/otel/)
+- [KEDA installation](https://keda.sh/docs/2.21/deploy/)
+- [KEDA Prometheus scaler](https://keda.sh/docs/2.21/scalers/prometheus/)

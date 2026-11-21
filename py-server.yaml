@@ -24,7 +24,6 @@ metadata:
   labels:
     app: python-server
 spec:
-  replicas: 1
   selector:
     matchLabels:
       app: python-server
@@ -44,6 +43,8 @@ spec:
           env:
             - name: OTEL_SERVICE_NAME
               value: python-server
+            - name: OTEL_METRIC_EXPORT_INTERVAL
+              value: "10000"
           command: ["/bin/sh", "-ec"]
           args:
             - |

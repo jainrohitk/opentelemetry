@@ -121,6 +121,7 @@ kube apply -f ./tempo.yaml
 kube rollout restart deployment/tempo -n default
 kube rollout status deployment/tempo -n default --timeout=300s
 kube apply -f ./prometheus.yaml
+kube rollout restart deployment/prometheus -n default
 kube rollout status deployment/prometheus -n default --timeout=300s
 kube apply -f ./loki.yaml
 # Reload Loki settings when the ConfigMap changes.
@@ -151,6 +152,24 @@ kube apply -f ./py-client.yaml
 kube rollout restart deployment/python-client -n python
 kube rollout status deployment/python-client -n python --timeout=300s
 
+echo "Installing KEDA..."
+keda_image="$(kube get deployment keda-operator -n keda --ignore-not-found \
+  -o 'jsonpath={.spec.template.spec.containers[0].image}')"
+if [[ -z "$keda_image" ]]; then
+  kube apply --server-side -f https://github.com/kedacore/keda/releases/download/v2.21.0/keda-2.21.0.yaml
+elif [[ "$keda_image" != "ghcr.io/kedacore/keda:2.21.0" ]]; then
+  printf 'Existing KEDA operator image differs from this sample: %s\nReview the installation before continuing.\n' \
+    "$keda_image" >&2
+  exit 1
+fi
+kube wait --for=condition=Established crd/scaledobjects.keda.sh --timeout=120s
+for deployment in keda-operator keda-metrics-apiserver keda-admission; do
+  kube rollout status "deployment/$deployment" -n keda --timeout=300s
+done
+kube wait --for=condition=Available apiservice/v1beta1.external.metrics.k8s.io --timeout=180s
+kube apply -f ./keda-scaler.yaml
+kube wait --for=condition=Ready scaledobject/python-server -n python --timeout=120s
+
 echo "Starting background port-forwards..."
 mkdir -p .port-forward
 start_port_forward python python deployment/python-server 5000:5000 http://127.0.0.1:5000/
@@ -166,6 +185,7 @@ echo "Open http://localhost:3000 and use Explore > Tempo to search traces."
 echo "Use Explore > Prometheus and query {service_name=\"python-server\"} to see app metrics."
 echo "Use Explore > Loki and query {service_name=\"python-server\"} to see app logs."
 echo "Prometheus UI: http://localhost:9090"
+echo "Autoscaling: kubectl --context kind-mykind get hpa -n python --watch"
 
 echo "Opening service URLs in your default browser..."
 open_browser http://localhost:5000/otel-test

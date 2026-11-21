@@ -1,0 +1,18 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: python-server
+  namespace: python
+spec:
+  scaleTargetRef:
+    name: python-server
+  minReplicaCount: 1
+  maxReplicaCount: 8
+  triggers:
+    - type: prometheus
+      metricType: AverageValue
+      metadata:
+        serverAddress: http://prometheus.default.svc.cluster.local:9090
+        query: sum(rate(http_server_duration_milliseconds_count{service_name="python-server",k8s_namespace_name="python",http_target!="/"}[30s]))
+        threshold: "5"
+        ignoreNullValues: "false"
