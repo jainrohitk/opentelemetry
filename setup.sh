@@ -28,6 +28,32 @@ kube() {
   kubectl --context kind-mykind "$@"
 }
 
+open_browser() {
+  local url="$1"
+  local -a browser
+  case "$OSTYPE" in
+    msys*|cygwin*)
+      browser=(powershell.exe -NoProfile -NonInteractive -Command "Start-Process '$url'")
+      ;;
+    darwin*)
+      browser=(open "$url")
+      ;;
+    linux*)
+      browser=(xdg-open "$url")
+      ;;
+    *)
+      printf 'Warning: automatic browser opening is not supported on %s. Open %s manually.\n' \
+        "$OSTYPE" "$url" >&2
+      return 0
+      ;;
+  esac
+  if ! command -v "${browser[0]}" >/dev/null 2>&1; then
+    printf 'Warning: %s is unavailable. Open %s manually.\n' "${browser[0]}" "$url" >&2
+  elif ! "${browser[@]}"; then
+    printf 'Warning: could not launch a browser. Open %s manually.\n' "$url" >&2
+  fi
+}
+
 start_port_forward() {
   local name="$1" namespace="$2" resource="$3" ports="$4" url="$5"
   local log=".port-forward/$name.log" pid attempt
@@ -89,11 +115,17 @@ kube wait --for=condition=Established \
   crd/opentelemetrycollectors.opentelemetry.io \
   crd/instrumentations.opentelemetry.io --timeout=120s
 
-echo "Deploying Tempo, Prometheus, and Grafana..."
+echo "Deploying Tempo, Prometheus, Loki, and Grafana..."
 kube apply -f ./tempo.yaml
+# Reload metrics-generator settings when the ConfigMap changes.
+kube rollout restart deployment/tempo -n default
 kube rollout status deployment/tempo -n default --timeout=300s
 kube apply -f ./prometheus.yaml
 kube rollout status deployment/prometheus -n default --timeout=300s
+kube apply -f ./loki.yaml
+# Reload Loki settings when the ConfigMap changes.
+kube rollout restart deployment/loki -n default
+kube rollout status deployment/loki -n default --timeout=300s
 kube apply -f ./grafana.yaml
 # Reload provisioned data sources when rerunning with an updated ConfigMap.
 kube rollout restart deployment/grafana -n default
@@ -125,4 +157,10 @@ echo "kubectl --context kind-mykind logs -n default deployment/demo-collector --
 echo "Visit http://localhost:5001/otel-test to generate telemetry."
 echo "Open http://localhost:3000 and use Explore > Tempo to search traces."
 echo "Use Explore > Prometheus and query {service_name=\"python-otel\"} to see app metrics."
+echo "Use Explore > Loki and query {service_name=\"python-otel\"} to see app logs."
 echo "Prometheus UI: http://localhost:9090"
+
+echo "Opening service URLs in your default browser..."
+open_browser http://localhost:5001/otel-test
+open_browser http://localhost:3000
+open_browser http://localhost:9090

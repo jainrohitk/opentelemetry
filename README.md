@@ -1,7 +1,7 @@
 # OpenTelemetry on Kubernetes: Python Quick Start
 
-Run a Python service on kind, view traces and metrics in Grafana, and check
-logs in Collector output. No application image build is needed.
+Run a Python service on kind and view traces, metrics, and logs in Grafana.
+Collector debug output also shows signal counts. No application image build is needed.
 
 ## Architecture
 
@@ -24,7 +24,8 @@ flowchart TB
             Collector["OpenTelemetry Collector<br/>demo-collector"]
             Tempo[("Tempo<br/>Trace storage")]
             Prometheus[("Prometheus<br/>Metrics storage")]
-            Grafana["Grafana<br/>Explore traces and metrics"]
+            Loki[("Loki<br/>Log storage")]
+            Grafana["Grafana<br/>Explore traces, metrics, and logs"]
             DebugLogs["Collector debug logs<br/>Traces, metrics, and logs"]
         end
     end
@@ -40,9 +41,12 @@ flowchart TB
 
     App -->|"Traces, metrics, logs: OTLP HTTP :4318"| Collector
     Collector -->|"Traces: OTLP gRPC :4317"| Tempo
+    Collector -->|"Logs: OTLP HTTP :3100/otlp/v1/logs"| Loki
+    Tempo -->|"Service-graph metrics: remote write :9090"| Prometheus
     Prometheus -->|"Scrape app metrics: HTTP :8889 every 15s"| Collector
     Grafana -->|"Query traces: HTTP :3200"| Tempo
     Grafana -->|"Query metrics: HTTP :9090"| Prometheus
+    Grafana -->|"Query logs: HTTP :3100"| Loki
     Collector -->|"Debug exporter: all three signals"| DebugLogs
 
     classDef app fill:#DBEAFE,stroke:#2563EB,color:#0F172A
@@ -51,20 +55,21 @@ flowchart TB
     classDef platform fill:#EDE9FE,stroke:#7C3AED,color:#0F172A
     class App app
     class Collector,Grafana collector
-    class Tempo,Prometheus storage
+    class Tempo,Prometheus,Loki storage
     class CertManager,Operator,Instrumentation platform
 ```
 
 Solid arrows show telemetry or query/request traffic; dotted arrows show
 configuration and management. Prometheus pulls metrics from the Collector;
-Grafana queries Tempo and Prometheus. Logs remain in Collector output.
+Tempo remote-writes trace-derived metrics to Prometheus. Grafana queries Tempo,
+Prometheus, and Loki. Logs are stored in Loki and also counted in Collector output.
 
 | Resource | Namespace |
 | --- | --- |
 | cert-manager | `cert-manager` |
 | OpenTelemetry Operator | `opentelemetry-operator-system` |
 | Collector `demo` | `default` |
-| Tempo, Prometheus, and Grafana | `default` |
+| Tempo, Prometheus, Loki, and Grafana | `default` |
 | Python Deployment and Instrumentation | `python` |
 
 Use **PowerShell** unless a block is marked **Bash**, from this repository's root.
@@ -83,15 +88,21 @@ bash setup.sh
 [setup.sh](./setup.sh) creates `mykind` if needed, installs the components in
 order, and waits for readiness. It targets `kind-mykind`, reuses the matching
 operator, and stops on errors. Rerunning updates the manifests and restarts the
-Python service to pick up instrumentation changes. Grafana also restarts to
-reload its provisioned data sources. A different existing operator version
-requires manual review.
+Python service to pick up instrumentation changes. Tempo restarts to reload
+metrics-generator settings, Loki restarts to reload its configuration, and
+Grafana restarts to reload its provisioned data sources. These restarts clear
+their temporary demo data. A different existing operator version requires manual review.
 
 The script starts and checks three `nohup` port-forwards: Python on `5001`,
 Grafana on `3000`, and Prometheus on `9090`. Logs and PIDs are saved in
 `.port-forward/` (ignored by Git). Stop existing recorded forwards before
-rerunning setup. Use Step 5 to generate traffic; the setup steps below are the
-manual alternative.
+rerunning setup. Once all three forwards are healthy, the script opens
+http://localhost:5001/otel-test, http://localhost:3000, and http://localhost:9090
+in your default browser. It uses PowerShell on Windows (Git Bash), `open` on
+macOS, and `xdg-open` on Linux. If no browser launcher is available or launching
+fails (for example, in a headless session), it warns and leaves the forwards
+running so you can open the URLs manually. Use Step 5 to generate more traffic;
+the setup steps below are the manual alternative.
 
 ## 1. Create a kind cluster
 
@@ -143,9 +154,13 @@ Pods. The Deployment file also declares the namespace.
 
 ```powershell
 kubectl apply -f .\tempo.yaml
+kubectl rollout restart deployment/tempo -n default
 kubectl rollout status deployment/tempo -n default --timeout=300s
 kubectl apply -f .\prometheus.yaml
 kubectl rollout status deployment/prometheus -n default --timeout=300s
+kubectl apply -f .\loki.yaml
+kubectl rollout restart deployment/loki -n default
+kubectl rollout status deployment/loki -n default --timeout=300s
 kubectl apply -f .\grafana.yaml
 kubectl rollout restart deployment/grafana -n default
 kubectl rollout status deployment/grafana -n default --timeout=300s
@@ -163,8 +178,9 @@ kubectl rollout status deployment/python-otel -n python --timeout=300s
 | [otel-operator.yaml](./otel-operator.yaml) | Install the operator, CRDs, permissions, and webhooks (Step 3) |
 | [tempo.yaml](./tempo.yaml) | Store and query traces |
 | [prometheus.yaml](./prometheus.yaml) | Scrape and store application metrics from the Collector |
-| [grafana.yaml](./grafana.yaml) | Grafana UI with Tempo and Prometheus data sources already configured |
-| [otel-collector.yaml](./otel-collector.yaml) | Export traces to Tempo, expose metrics to Prometheus, and print all three signals |
+| [loki.yaml](./loki.yaml) | Store and query OpenTelemetry application logs |
+| [grafana.yaml](./grafana.yaml) | Grafana UI with Tempo, Prometheus, and Loki data sources already configured |
+| [otel-collector.yaml](./otel-collector.yaml) | Export traces to Tempo and logs to Loki, expose metrics to Prometheus, and print all three signals |
 | [python-instrumentation.yaml](./python-instrumentation.yaml) | Configure Python instrumentation and the collector endpoint |
 | [python-deployment.yaml](./python-deployment.yaml) | Create namespace `python` and run an inline Flask app using official `python:3.12-slim` |
 
@@ -280,7 +296,7 @@ In this setup:
   timing. **Tempo stores the traces; Grafana provides the UI.**
 
 Tempo does not store this app's metrics or logs. Prometheus stores metrics;
-logs currently appear only in Collector output. The [Tempo manifest](./tempo.yaml)
+Loki stores logs. The [Tempo manifest](./tempo.yaml)
 uses temporary Pod storage, so its traces disappear when the Pod is replaced.
 
 ### View traces in Grafana
@@ -316,8 +332,48 @@ To find HTTP request measurements, use:
 Prometheus scrapes the Collector's application-metrics exporter on port `8889`,
 not the Collector's internal monitoring port `8888`. The exporter includes
 resource attributes as labels, including `service_name`.
-Logs still appear only in Collector output; a logs backend such as Loki is not
-included.
+
+### View logs in Grafana
+
+Choose **Explore > Loki**, select the last 15 minutes, and run:
+
+```logql
+{service_name="python-otel"}
+```
+
+Generate fresh requests using Step 5, wait a few seconds for export, and refresh.
+The Collector sends application log records to Loki's native OTLP HTTP endpoint.
+Loki converts the resource attribute `service.name` into the label `service_name`.
+Expand a log entry to inspect structured metadata, including trace and span IDs
+when present.
+
+No extra port-forward is needed: Grafana queries Loki inside the cluster.
+Collector debug output remains enabled. This does not collect arbitrary
+container stdout or Kubernetes system logs; those need a separate log collector.
+Logs emitted before Loki was connected are not backfilled from Collector output.
+
+### View service graphs in Grafana
+
+Choose **Explore > Tempo > Service Graph** and run a query. The Tempo data
+source is provisioned with the Prometheus data source linked under **Service
+graph**. Tempo's metrics-generator produces service-graph and span metrics and
+remote-writes them to Prometheus; the Collector's application metrics alone do
+not provide service graphs.
+
+Generate fresh requests and allow 60-90 seconds, then query
+`traces_spanmetrics_calls_total` in **Explore > Prometheus** to confirm metrics
+generation. For graph edges, query `traces_service_graph_request_total`.
+This demo has one instrumented service, so it does not show a multi-service
+topology; external callers may appear as a virtual node.
+
+If Grafana reports **No service graph datasource selected**, apply
+[grafana.yaml](./grafana.yaml) and restart Grafana to reload provisioning. For
+an existing installation, also apply [tempo.yaml](./tempo.yaml) and
+[prometheus.yaml](./prometheus.yaml), restart Tempo, and wait for all three
+Deployments to become ready using Step 4. Restarting Tempo, Grafana, or
+Prometheus clears that component's temporary demo data. Their active
+port-forwards may exit when Pods are replaced; inspect and stop any remaining
+recorded forwards before starting new ones.
 
 ## Troubleshooting
 
@@ -352,14 +408,19 @@ kubectl exec -n python deployment/python-otel -c python-otel -- printenv OTEL_EX
 - **No metrics in Grafana:** allow 60-90 seconds after making requests. Check
   Prometheus readiness and its scrape target, and confirm the Collector Service
   exposes port `8889`. Rerun setup to reload the Grafana data sources.
+- **No logs in Grafana:** generate fresh requests, check Loki readiness and
+  Collector export errors, and use `{service_name="python-otel"}` in Explore.
+  Loki's OTLP ingestion requires schema `v13` and structured metadata enabled.
+  Apply the Loki, Collector, and Grafana manifests and restart Grafana if the
+  Loki data source is missing.
 
 ## Notes
 
 - One collector can serve multiple microservices; give each a distinct
   `service.name`.
 - Tempo uses temporary Pod storage: traces are lost when its Pod is replaced.
-  Prometheus metrics and Grafana's local database are temporary too; both Grafana
-  data sources are provisioned automatically at startup.
+  Prometheus metrics, Loki logs, and Grafana's local database are temporary too;
+  all three Grafana data sources are provisioned automatically at startup.
 - Grafana allows anonymous Editor access for Explore. Keep it internal and use
   localhost port-forward only; configure authentication before exposing it.
 - Local demo only: Flask's development server and unauthenticated OTLP endpoints
@@ -372,4 +433,6 @@ kubectl exec -n python deployment/python-otel -c python-otel -- printenv OTEL_EX
 - [OpenTelemetry Operator](https://opentelemetry.io/docs/platforms/kubernetes/operator/)
 - [Collector and automatic instrumentation](https://opentelemetry.io/docs/platforms/kubernetes/operator/automatic/)
 - [Tempo data source](https://grafana.com/docs/grafana/latest/datasources/tempo/configure-tempo-data-source/)
+- [Tempo service graphs](https://grafana.com/docs/grafana/latest/datasources/tempo/service-graph/)
 - [Prometheus data source](https://grafana.com/docs/grafana/latest/datasources/prometheus/)
+- [Loki OpenTelemetry ingestion](https://grafana.com/docs/loki/latest/send-data/otel/)

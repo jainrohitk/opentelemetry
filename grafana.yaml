@@ -14,11 +14,20 @@ data:
         url: http://tempo.default.svc.cluster.local:3200
         isDefault: true
         editable: false
+        jsonData:
+          serviceMap:
+            datasourceUid: prometheus
       - name: Prometheus
         type: prometheus
         uid: prometheus
         access: proxy
         url: http://prometheus.default.svc.cluster.local:9090
+        editable: false
+      - name: Loki
+        type: loki
+        uid: loki
+        access: proxy
+        url: http://loki.default.svc.cluster.local:3100
         editable: false
 ---
 apiVersion: v1

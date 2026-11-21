@@ -52,6 +52,7 @@ spec:
           image: prom/prometheus:v3.7.3
           args:
             - --config.file=/etc/prometheus/prometheus.yml
+            - --web.enable-remote-write-receiver
             - --storage.tsdb.path=/prometheus
             - --storage.tsdb.retention.time=1h
           ports:

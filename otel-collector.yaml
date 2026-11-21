@@ -37,6 +37,8 @@ spec:
         endpoint: tempo.default.svc.cluster.local:4317
         tls:
           insecure: true
+      otlphttp/loki:
+        endpoint: http://loki.default.svc.cluster.local:3100/otlp
       debug:
         # Print signal counts to collector logs; use detailed for payloads and span IDs.
         verbosity: basic
@@ -58,4 +60,4 @@ spec:
         logs:
           receivers: [otlp]
           processors: [memory_limiter]
-          exporters: [debug]
+          exporters: [debug, otlphttp/loki]
