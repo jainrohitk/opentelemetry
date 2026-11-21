@@ -3,31 +3,47 @@ kind: Namespace
 metadata:
   name: python
 ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: python-server
+  namespace: python
+spec:
+  selector:
+    app: python-server
+  ports:
+    - name: http
+      port: 5000
+      targetPort: 5000
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: python-otel
+  name: python-server
   namespace: python
   labels:
-    app: python-otel
+    app: python-server
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: python-otel
+      app: python-server
   template:
     metadata:
       annotations:
         instrumentation.opentelemetry.io/inject-python: "true"  # Important for enabling OpenTelemetry Python auto-instrumentation
       labels:
-        app: python-otel
+        app: python-server
     spec:
       nodeSelector:
         kubernetes.io/os: linux
       containers:
-        - name: python-otel
+        - name: python-server
           image: python:3.12-slim
           imagePullPolicy: IfNotPresent
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: python-server
           command: ["/bin/sh", "-ec"]
           args:
             - |

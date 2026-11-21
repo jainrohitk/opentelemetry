@@ -1,6 +1,6 @@
 # OpenTelemetry on Kubernetes: Python Quick Start
 
-Run a Python service on kind and view traces, metrics, and logs in Grafana.
+Run two communicating Python services on kind and view traces, metrics, and logs in Grafana.
 Collector debug output also shows signal counts. No application image build is needed.
 
 ## Architecture
@@ -18,6 +18,7 @@ flowchart TB
         subgraph PythonNamespace["Namespace: python"]
             Instrumentation["Python Instrumentation<br/>Collector endpoint and SDK settings"]
             App["Python Flask Pod<br/>Auto-instrumented<br/>Port 5000"]
+            Client["Python caller Pod<br/>Auto-instrumented<br/>Port 5000"]
         end
 
         subgraph DefaultNamespace["Namespace: default"]
@@ -30,16 +31,20 @@ flowchart TB
         end
     end
 
-    Browser -->|"App: localhost:5001 to Pod:5000"| App
+    Browser -->|"App: localhost:5000 to Pod:5000"| App
+    Browser -->|"Caller: localhost:5001 to Pod:5000"| Client
+    Client -->|"HTTP via python-server Service :5000"| App
     Browser -->|"Grafana: localhost:3000 to Service:3000"| Grafana
     Browser -->|"Prometheus UI: localhost:9090 to Service:9090"| Prometheus
 
     CertManager -.->|"Webhook TLS certificates"| Operator
     Instrumentation -.->|"Instrumentation settings"| Operator
     Operator -.->|"Inject Python libraries when annotated Pods are created"| App
+    Operator -.->|"Inject Flask and Requests instrumentation"| Client
     Operator -.->|"Manage Collector resources"| Collector
 
     App -->|"Traces, metrics, logs: OTLP HTTP :4318"| Collector
+    Client -->|"Traces, metrics, logs: OTLP HTTP :4318"| Collector
     Collector -->|"Traces: OTLP gRPC :4317"| Tempo
     Collector -->|"Logs: OTLP HTTP :3100/otlp/v1/logs"| Loki
     Tempo -->|"Service-graph metrics: remote write :9090"| Prometheus
@@ -53,7 +58,7 @@ flowchart TB
     classDef collector fill:#FEF3C7,stroke:#D97706,color:#0F172A
     classDef storage fill:#DCFCE7,stroke:#16A34A,color:#0F172A
     classDef platform fill:#EDE9FE,stroke:#7C3AED,color:#0F172A
-    class App app
+    class App,Client app
     class Collector,Grafana collector
     class Tempo,Prometheus,Loki storage
     class CertManager,Operator,Instrumentation platform
@@ -70,7 +75,7 @@ Prometheus, and Loki. Logs are stored in Loki and also counted in Collector outp
 | OpenTelemetry Operator | `opentelemetry-operator-system` |
 | Collector `demo` | `default` |
 | Tempo, Prometheus, Loki, and Grafana | `default` |
-| Python Deployment and Instrumentation | `python` |
+| Python backend Service, both Deployments, and Instrumentation | `python` |
 
 Use **PowerShell** unless a block is marked **Bash**, from this repository's root.
 Install Docker Desktop (Linux
@@ -88,16 +93,17 @@ bash setup.sh
 [setup.sh](./setup.sh) creates `mykind` if needed, installs the components in
 order, and waits for readiness. It targets `kind-mykind`, reuses the matching
 operator, and stops on errors. Rerunning updates the manifests and restarts the
-Python service to pick up instrumentation changes. Tempo restarts to reload
+Python services to pick up instrumentation changes. Tempo restarts to reload
 metrics-generator settings, Loki restarts to reload its configuration, and
 Grafana restarts to reload its provisioned data sources. These restarts clear
 their temporary demo data. A different existing operator version requires manual review.
 
-The script starts and checks three `nohup` port-forwards: Python on `5001`,
-Grafana on `3000`, and Prometheus on `9090`. Logs and PIDs are saved in
+The script starts and checks four `nohup` port-forwards: Python on `5000`,
+the caller on `5001`, Grafana on `3000`, and Prometheus on `9090`. Logs and PIDs are saved in
 `.port-forward/` (ignored by Git). Stop existing recorded forwards before
-rerunning setup. Once all three forwards are healthy, the script opens
-http://localhost:5001/otel-test, http://localhost:3000, and http://localhost:9090
+rerunning setup. Once all four forwards are healthy, the script opens
+http://localhost:5000/otel-test, http://localhost:5001/otel-test,
+http://localhost:3000, and http://localhost:9090
 in your default browser. It uses PowerShell on Windows (Git Bash), `open` on
 macOS, and `xdg-open` on Linux. If no browser launcher is available or launching
 fails (for example, in a headless session), it warns and leaves the forwards
@@ -168,9 +174,11 @@ kubectl apply -f .\otel-collector.yaml
 kubectl wait --for=condition=Ready opentelemetrycollector/demo -n default --timeout=180s
 kubectl rollout status deployment/demo-collector -n default --timeout=180s
 kubectl create namespace python --dry-run=client -o yaml | kubectl apply -f -
-kubectl apply -f .\python-instrumentation.yaml
-kubectl apply -f .\python-deployment.yaml
-kubectl rollout status deployment/python-otel -n python --timeout=300s
+kubectl apply -f .\py-instrumentation.yaml
+kubectl apply -f .\py-server.yaml
+kubectl rollout status deployment/python-server -n python --timeout=300s
+kubectl apply -f .\py-client.yaml
+kubectl rollout status deployment/python-client -n python --timeout=300s
 ```
 
 | File | Purpose |
@@ -181,10 +189,22 @@ kubectl rollout status deployment/python-otel -n python --timeout=300s
 | [loki.yaml](./loki.yaml) | Store and query OpenTelemetry application logs |
 | [grafana.yaml](./grafana.yaml) | Grafana UI with Tempo, Prometheus, and Loki data sources already configured |
 | [otel-collector.yaml](./otel-collector.yaml) | Export traces to Tempo and logs to Loki, expose metrics to Prometheus, and print all three signals |
-| [python-instrumentation.yaml](./python-instrumentation.yaml) | Configure Python instrumentation and the collector endpoint |
-| [python-deployment.yaml](./python-deployment.yaml) | Create namespace `python` and run an inline Flask app using official `python:3.12-slim` |
+| [py-instrumentation.yaml](./py-instrumentation.yaml) | Configure Python instrumentation and the collector endpoint |
+| [py-server.yaml](./py-server.yaml) | Create namespace `python` and run an inline Flask app using official `python:3.12-slim` |
+| [py-client.yaml](./py-client.yaml) | Run an instrumented Flask caller that uses Requests to call the backend Service |
 
-The app installs Flask at startup, so each new container needs internet access.
+When migrating from the old `python-otel` name, deploy `python-server` and wait
+for readiness before applying the updated caller. Verify a caller request, then
+remove only the old Deployment and Service:
+
+```powershell
+kubectl --context kind-mykind delete deployment/python-otel service/python-otel -n python
+```
+
+Restart the two Python port-forwards after migration. Historical telemetry keeps
+the old service name until it ages out; fresh traffic uses `python-server`.
+
+The apps install Flask (and Requests for the caller) at startup, so each new container needs internet access.
 A startup probe allows time for installation. This is a learning convenience,
 not a production packaging approach.
 
@@ -220,8 +240,10 @@ Setup starts these automatically. For a manual setup, run the following in
 
 ```bash
 mkdir -p .port-forward
-nohup kubectl --context kind-mykind port-forward deployment/python-otel 5001:5000 -n python --address 127.0.0.1 > .port-forward/python.log 2>&1 < /dev/null &
+nohup kubectl --context kind-mykind port-forward deployment/python-server 5000:5000 -n python --address 127.0.0.1 > .port-forward/python.log 2>&1 < /dev/null &
 echo $! > .port-forward/python.pid
+nohup kubectl --context kind-mykind port-forward deployment/python-client 5001:5000 -n python --address 127.0.0.1 > .port-forward/python-client.log 2>&1 < /dev/null &
+echo $! > .port-forward/python-client.pid
 nohup kubectl --context kind-mykind port-forward service/grafana 3000:3000 -n default --address 127.0.0.1 > .port-forward/grafana.log 2>&1 < /dev/null &
 echo $! > .port-forward/grafana.pid
 nohup kubectl --context kind-mykind port-forward service/prometheus 9090:9090 -n default --address 127.0.0.1 > .port-forward/prometheus.log 2>&1 < /dev/null &
@@ -230,7 +252,8 @@ echo $! > .port-forward/prometheus.pid
 
 | App | URL |
 | --- | --- |
-| Python | http://localhost:5001/otel-test |
+| Python | http://localhost:5000/otel-test |
+| Python caller | http://localhost:5001/otel-test |
 | Grafana | http://localhost:3000 |
 | Prometheus | http://localhost:9090 |
 
@@ -243,19 +266,49 @@ To stop them in Bash, first confirm the recorded PIDs still belong to these
 
 ```bash
 kill "$(cat .port-forward/python.pid)"
+kill "$(cat .port-forward/python-client.pid)"
 kill "$(cat .port-forward/grafana.pid)"
 kill "$(cat .port-forward/prometheus.pid)"
 ```
 
 ### Generate traffic
 
-Send requests from PowerShell:
+With the caller port-forward running, use [generate-traffic.ps1](./generate-traffic.ps1)
+from PowerShell to send 5,000 requests at approximately 10-20 requests per second,
+with up to 2 requests in flight. Traffic goes to the caller on port `5001`, which
+forwards it to `python-server`. Paths, query parameters, and pacing are randomized:
 
 ```powershell
-1..10 | ForEach-Object {
-    Invoke-WebRequest http://localhost:5001/otel-test -UseBasicParsing | Out-Null
-}
+.\generate-traffic.ps1
 ```
+
+Current default values:
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `Count` | `5000` | Total requests |
+| `MinRequestsPerSecond` | `10` | Lower end of randomized target rate |
+| `MaxRequestsPerSecond` | `20` | Upper end of randomized target rate |
+| `Concurrency` | `2` | Maximum requests in flight |
+| `Port` | `5001` | Caller port-forward |
+
+For example, override these defaults for a shorter run with higher concurrency:
+
+```powershell
+.\generate-traffic.ps1 -Count 2000 -MinRequestsPerSecond 15 -MaxRequestsPerSecond 20 -Concurrency 5
+```
+
+Use `-Port 5000` to target the backend directly instead; those requests do not
+create a `python-client` to `python-server` relationship.
+
+The rate applies to the whole script, not each worker. Slow responses may lower
+the achieved rate once the concurrency limit is reached; missed slots are not
+replayed as bursts. At the target rate, the default run takes about 4-8 minutes;
+slow responses can make it take longer.
+The script prints each response status, a summary, and the measured average rate.
+Failed requests produce warnings, and the script exits with code `1` if any
+request fails. It uses asynchronous HTTP requests and supports Windows PowerShell
+5.1 and PowerShell 7.
 
 Watch the collector in another terminal:
 
@@ -305,7 +358,7 @@ Open **http://localhost:3000**; no login is needed for this local demo.
 Choose **Explore > Tempo**, select the last 15 minutes, and run this TraceQL query:
 
 ```traceql
-{ resource.service.name = "python-otel" }
+{ resource.service.name = "python-server" }
 ```
 
 Generate fresh app requests, allow a few seconds for export, then refresh.
@@ -318,7 +371,7 @@ Grafana queries Tempo; it does not read traces from the collector's logs.
 In the same Grafana instance, choose **Explore > Prometheus** and run:
 
 ```promql
-{service_name="python-otel"}
+{service_name="python-server"}
 ```
 
 Generate app requests and allow 60-90 seconds for Python's periodic metrics
@@ -326,7 +379,7 @@ export and Prometheus scraping. Switch to a graph to see values over time.
 To find HTTP request measurements, use:
 
 ```promql
-{service_name="python-otel", __name__=~"http_.*"}
+{service_name="python-server", __name__=~"http_.*"}
 ```
 
 Prometheus scrapes the Collector's application-metrics exporter on port `8889`,
@@ -338,7 +391,7 @@ resource attributes as labels, including `service_name`.
 Choose **Explore > Loki**, select the last 15 minutes, and run:
 
 ```logql
-{service_name="python-otel"}
+{service_name="python-server"}
 ```
 
 Generate fresh requests using Step 5, wait a few seconds for export, and refresh.
@@ -363,8 +416,21 @@ not provide service graphs.
 Generate fresh requests and allow 60-90 seconds, then query
 `traces_spanmetrics_calls_total` in **Explore > Prometheus** to confirm metrics
 generation. For graph edges, query `traces_service_graph_request_total`.
-This demo has one instrumented service, so it does not show a multi-service
-topology; external callers may appear as a virtual node.
+Traffic through port `5001` should show `python-client -> python-server`.
+Both services use the same Instrumentation resource with W3C trace-context
+propagation. Flask creates server spans and Requests creates the caller's
+outgoing client spans; both services' spans belong to the same trace.
+External callers may also appear as a virtual node.
+
+To verify the relationship in **Explore > Prometheus**, query:
+
+```promql
+traces_service_graph_request_total{client="python-client", server="python-server"}
+```
+
+In **Explore > Tempo**, search for `{ resource.service.name = "python-client" }`
+and open a trace to inspect spans from both services. To see both services' logs
+in Loki, use `{service_name=~"python-client|python-server"}`.
 
 If Grafana reports **No service graph datasource selected**, apply
 [grafana.yaml](./grafana.yaml) and restart Grafana to reload provisioning. For
@@ -380,9 +446,9 @@ recorded forwards before starting new ones.
 Start with application logs and Pod details:
 
 ```powershell
-kubectl logs -n python deployment/python-otel -c python-otel --tail=100
-kubectl describe pods -n python -l app=python-otel
-kubectl exec -n python deployment/python-otel -c python-otel -- printenv OTEL_EXPORTER_OTLP_ENDPOINT
+kubectl logs -n python deployment/python-server -c python-server --tail=100
+kubectl describe pods -n python -l app=python-server
+kubectl exec -n python deployment/python-server -c python-server -- printenv OTEL_EXPORTER_OTLP_ENDPOINT
 ```
 
 - **No injection:** check the Pod-template annotation and the Instrumentation
@@ -392,8 +458,8 @@ kubectl exec -n python deployment/python-otel -c python-otel -- printenv OTEL_EX
   Recreate them:
 
   ```powershell
-  kubectl rollout restart deployment/python-otel -n python
-  kubectl rollout status deployment/python-otel -n python --timeout=300s
+  kubectl rollout restart deployment/python-server -n python
+  kubectl rollout status deployment/python-server -n python --timeout=300s
   ```
 
 - **Only collector startup messages:** readiness is not proof of received data.
@@ -405,11 +471,16 @@ kubectl exec -n python deployment/python-otel -c python-otel -- printenv OTEL_EX
 - **No traces in Grafana:** generate fresh requests and check the time range,
   Tempo readiness, and Collector export errors. Traces received before Tempo was
   configured are not backfilled from Collector logs.
+- **Tempo restarts during traffic:** inspect its Pod's last termination reason
+  and logs. The demo gives Tempo a `1Gi` memory limit and an `800MiB` Go memory
+  target for trace ingestion and metrics generation; larger loads may need more.
+  `OOMKilled` means the container exceeded its memory limit. Config parse errors
+  require correcting the embedded YAML in [tempo.yaml](./tempo.yaml).
 - **No metrics in Grafana:** allow 60-90 seconds after making requests. Check
   Prometheus readiness and its scrape target, and confirm the Collector Service
   exposes port `8889`. Rerun setup to reload the Grafana data sources.
 - **No logs in Grafana:** generate fresh requests, check Loki readiness and
-  Collector export errors, and use `{service_name="python-otel"}` in Explore.
+  Collector export errors, and use `{service_name="python-server"}` in Explore.
   Loki's OTLP ingestion requires schema `v13` and structured metadata enabled.
   Apply the Loki, Collector, and Grafana manifests and restart Grafana if the
   Loki data source is missing.

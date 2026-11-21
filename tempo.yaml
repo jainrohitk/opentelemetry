@@ -27,7 +27,7 @@ data:
       compaction:
         block_retention: 1h
     metrics_generator:
-      storag
+      storage:
         path: /var/tempo/generator/wal
         remote_write:
           - url: http://prometheus.default.svc.cluster.local:9090/api/v1/write
@@ -85,6 +85,9 @@ spec:
         - name: tempo
           image: grafana/tempo:2.9.0
           args: ["-config.file=/etc/tempo/tempo.yaml"]
+          env:
+            - name: GOMEMLIMIT
+              value: "800MiB"
           ports:
             - containerPort: 3200
             - containerPort: 4317
@@ -98,7 +101,7 @@ spec:
               memory: "128Mi"
             limits:
               cpu: "1"
-              memory: "512Mi"
+              memory: "1Gi"
           volumeMounts:
             - name: config
               mountPath: /etc/tempo

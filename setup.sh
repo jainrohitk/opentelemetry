@@ -10,7 +10,7 @@ for tool in docker kind kubectl nohup curl; do
   fi
 done
 
-for name in python grafana prometheus; do
+for name in python python-client grafana prometheus; do
   if [[ -f ".port-forward/$name.pid" ]]; then
     if ! read -r pid < ".port-forward/$name.pid" || [[ ! "$pid" =~ ^[1-9][0-9]*$ ]]; then
       printf 'Invalid PID file: .port-forward/%s.pid. Inspect it before rerunning setup.\n' "$name" >&2
@@ -138,29 +138,37 @@ kube rollout status deployment/demo-collector -n default --timeout=180s
 
 echo "Configuring Python instrumentation..."
 kube create namespace python --dry-run=client -o yaml | kube apply -f -
-kube apply -f ./python-instrumentation.yaml
+kube apply -f ./py-instrumentation.yaml
 
 echo "Deploying Python service..."
-kube apply -f ./python-deployment.yaml
+kube apply -f ./py-server.yaml
 # Existing Pods must be recreated to pick up Instrumentation changes.
-kube rollout restart deployment/python-otel -n python
-kube rollout status deployment/python-otel -n python --timeout=300s
+kube rollout restart deployment/python-server -n python
+kube rollout status deployment/python-server -n python --timeout=300s
+
+echo "Deploying instrumented Python caller..."
+kube apply -f ./py-client.yaml
+kube rollout restart deployment/python-client -n python
+kube rollout status deployment/python-client -n python --timeout=300s
 
 echo "Starting background port-forwards..."
 mkdir -p .port-forward
-start_port_forward python python deployment/python-otel 5001:5000 http://127.0.0.1:5001/
+start_port_forward python python deployment/python-server 5000:5000 http://127.0.0.1:5000/
+start_port_forward python-client python deployment/python-client 5001:5000 http://127.0.0.1:5001/health
 start_port_forward grafana default service/grafana 3000:3000 http://127.0.0.1:3000/api/health
 start_port_forward prometheus default service/prometheus 9090:9090 http://127.0.0.1:9090/-/ready
 
 echo "Setup complete. Port-forward logs and PIDs are in .port-forward/."
 echo "kubectl --context kind-mykind logs -n default deployment/demo-collector --follow --since=2m"
-echo "Visit http://localhost:5001/otel-test to generate telemetry."
+echo "Visit http://localhost:5000/otel-test to generate telemetry."
+echo "Visit http://localhost:5001/otel-test to trace python-client -> python-server."
 echo "Open http://localhost:3000 and use Explore > Tempo to search traces."
-echo "Use Explore > Prometheus and query {service_name=\"python-otel\"} to see app metrics."
-echo "Use Explore > Loki and query {service_name=\"python-otel\"} to see app logs."
+echo "Use Explore > Prometheus and query {service_name=\"python-server\"} to see app metrics."
+echo "Use Explore > Loki and query {service_name=\"python-server\"} to see app logs."
 echo "Prometheus UI: http://localhost:9090"
 
 echo "Opening service URLs in your default browser..."
+open_browser http://localhost:5000/otel-test
 open_browser http://localhost:5001/otel-test
 open_browser http://localhost:3000
 open_browser http://localhost:9090
