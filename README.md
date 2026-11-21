@@ -206,17 +206,6 @@ kubectl rollout status deployment/python-client -n python --timeout=300s
 | [py-client.yaml](./py-client.yaml) | Run an instrumented Flask caller that uses Requests to call the backend Service |
 | [keda-scaler.yaml](./keda-scaler.yaml) | Scale `python-server` from 1 to 8 replicas using application request rate |
 
-When migrating from the old `python-otel` name, deploy `python-server` and wait
-for readiness before applying the updated caller. Verify a caller request, then
-remove only the old Deployment and Service:
-
-```powershell
-kubectl --context kind-mykind delete deployment/python-otel service/python-otel -n python
-```
-
-Restart the two Python port-forwards after migration. Historical telemetry keeps
-the old service name until it ages out; fresh traffic uses `python-server`.
-
 The apps install Flask (and Requests for the caller) at startup, so each new container needs internet access.
 A startup probe allows time for installation. This is a learning convenience,
 not a production packaging approach.
