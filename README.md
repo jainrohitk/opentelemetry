@@ -219,8 +219,8 @@ not a production packaging approach.
 http://demo-collector.default.svc.cluster.local:4318
 ```
 
-**Annotation:** put it on the Deployment's **Pod template**, not only on the
-Deployment's top-level metadata:
+**Annotation:** for an individual Deployment, put it on the **Pod template**,
+not only on the Deployment's top-level metadata:
 
 ```yaml
 spec:
@@ -232,6 +232,30 @@ spec:
 
 If multiple Instrumentation resources exist in `python`, use
 `"python-instrumentation"` instead of `"true"` to select this one explicitly.
+
+Alternatively, annotate the **namespace** to enable Python auto-instrumentation
+for newly created Pods across all Deployments in that namespace:
+
+```powershell
+kubectl --context kind-mykind annotate namespace python instrumentation.opentelemetry.io/inject-python=python-instrumentation --overwrite
+```
+
+This selects the existing `python-instrumentation` resource in `python`.
+The Operator uses the namespace annotation when creating Pods; Kubernetes does
+not copy it into each Deployment's metadata. Individual Pod-template annotations
+are not required when using this namespace-wide setting.
+
+Existing Pods are not retroactively instrumented. Recreate the demo's Pods to
+pick up the namespace setting:
+
+```powershell
+kubectl --context kind-mykind rollout restart deployment/python-server deployment/python-client -n python
+kubectl --context kind-mykind rollout status deployment/python-server -n python --timeout=300s
+kubectl --context kind-mykind rollout status deployment/python-client -n python --timeout=300s
+```
+
+See the [Operator auto-instrumentation documentation](https://opentelemetry.io/docs/platforms/kubernetes/operator/automatic/#add-annotations-to-existing-deployments)
+for namespace-level opt-in.
 
 ## 5. Generate traffic and view telemetry
 
